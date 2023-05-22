@@ -1,0 +1,723 @@
+---
+title: |
+      **Development of a test data set for spatial interpolation based on ERA5 Land data**
+subtitle: ''
+author: Santiago Beguería
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    df_print: paged 
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    fig_caption: yes
+    toc_float: true
+    collapsed: false
+  pdf_document:
+    fig_caption: yes
+    highlight: zenburn
+    toc: yes
+    toc_depth: 4
+abstract: |
+  .
+---
+
+```{r setup, include=FALSE}
+# knitr global options 
+knitr::opts_chunk$set( echo = FALSE, message = FALSE, warning = FALSE)
+
+# Dependencies (and install packages, if needed)
+# KrigR is not yet on CRAN, so it needs to be installed as such:
+if (!require('KrigR')) devtools::install_github('https://github.com/ErikKusch/KrigR')
+if (!require('pacman')) install.packages('pacman')
+pacman::p_load(magrittr, dplyr, ncdf4, KrigR)
+               #data.table, reshape,
+               #rgdal, raster, sp, gstat, automap, geoR,
+               #hydroGOF, ggplot2, hexbin, scales, SPEI, broom,
+               #lmomco, caret, snowfall, parallel, ggh4x)
+
+# Projections
+#prj_geo <- '+proj=longlat +datum=WGS84 +no_defs'
+#prj_utm <- '+proj=utm +zone=30 +ellps=intl +towgs84=-87,-98,-121,0,0,0,0 +units=m +no_defs'
+
+# Load a vector map of peninsular Spain
+shp_geo <- readOGR('../data_raw/gis/españa_peninsular_EPSG4326.shp')
+#shp_utm <- spTransform(shp_geo, prj_utm)
+#shp_utm_tdy <- broom::tidy(shp_utm)
+
+# Copernicus API user and key
+API_usr <- '178221'
+API_key <- '87924e78-559e-4f8a-bd48-34aa8508c446'
+```
+
+
+----
+
+# Download ERA5 (Land) data
+
+Variables (units):
+
+* 2m_temperature (K)
+* Total_precipitation (m)
+* 2m_dewpoint_temperature (K)
+* 10m_u-component_of_wind (m s-1)
+* 10m_v-component_of_wind (m s-1)
+* Surface_net_solar_radiation (J m-2)
+
+```{r eval=FALSE, include=FALSE}
+# Example: monthly precipitation over Spain.
+kk <- download_ERA(
+  Variable = 'Total_precipitation',
+  PrecipFix = TRUE,
+  Type = 'reanalysis',
+  DataSet = 'era5-land',
+  DateStart = '1981-01-01',
+  DateStop = '1981-12-31', # Sys.Date() - 100,
+  TResolution = 'month',
+  TStep = 1,
+  FUN = 'mean',
+  Extent = shp_geo,
+  Buffer = 0.5,
+  ID = 'ID',
+  Dir = '../data_raw/era5',
+  FileName = NULL,
+  API_User = API_usr,
+  API_Key = API_key,
+  TryDown = 10,
+  verbose = TRUE,
+  Cores = 1,
+  TimeOut = 36000,
+  SingularDL = FALSE
+)
+class(kk)
+dim(kk)
+
+# Example: daily mean temperature over Spain.
+kk2 <- download_ERA(
+  Variable = '2m_temperature',
+  DataSet = 'era5-land',
+  DateStart = '1995-01-01',
+  DateStop = '1995-01-12',
+  TResolution = 'hour',
+  TStep = 24,
+  Extent = shp_geo,
+  Dir = '../data_raw/era5',
+  API_User = API_usr,
+  API_Key = API_key
+)
+
+# Example: daily total precipitation over Spain.
+kk3 <- download_ERA(
+  Variable = 'Total_precipitation',
+  DataSet = 'era5-land',
+  DateStart = '1995-01-01',
+  DateStop = '1995-01-12',
+  TResolution = 'hour',
+  TStep = 24,
+  FUN = 'sum',
+  Extent = shp_geo,
+  Dir = '../data_raw/era5',
+  API_User = API_usr,
+  API_Key = API_key
+)
+
+plot(kk)
+plot(kk2)
+plot(kk3)
+```
+
+
+```{r}
+# pcp
+#pcp.nc <- nc_open('../data_raw/era5/pcp.nc')
+#pcp <- ncvar_get(pcp.nc, 'Precipitation', start=c(1, 1, 1), count=c(-1, -1, -1))
+pcp <- download_ERA(
+  Variable = 'Total_precipitation',
+  DataSet = 'era5-land',
+  DateStart = '1981-01-01',
+  DateStop = '2020-12-31',
+  TResolution = 'hour',
+  TStep = 24,
+  FUN = 'sum',
+  Extent = shp_geo,
+  Dir = '../data_raw/era5',
+  API_User = API_usr,
+  API_Key = API_key
+)
+```
+
+```{r}
+# A modified download_ERA function that only downloads the data (no aggregation).
+download_ERA1 <- function (Variable = NULL, PrecipFix = FALSE, Type = "reanalysis", 
+    DataSet = "era5-land", DateStart = "1981-01-01", DateStop = Sys.Date() - 
+        100, TResolution = "month", TStep = 1, FUN = "mean", 
+    Extent = extent(-180, 180, -90, 90), Buffer = 0.5, ID = "ID", 
+    Dir = getwd(), FileName = NULL, API_User = NULL, API_Key = NULL, 
+    TryDown = 10, verbose = TRUE, Cores = 1, TimeOut = 36000, 
+    SingularDL = FALSE) 
+{
+    if (verbose) {
+        message("download_ERA() is starting. Depending on your specifications, this can take a significant time.")
+    }
+    if (verbose) {
+        ProgBar <- "text"
+    }
+    else {
+        ProgBar <- NULL
+    }
+    API_Service = "cds"
+    wf_set_key(user = as.character(API_User), key = as.character(API_Key), 
+        service = API_Service)
+    if (DataSet == "era5-land") {
+        Grid <- ".1/.1"
+    }
+    else {
+        Grid <- ".5/.5"
+    }
+    TypeOrigin <- Type
+    if (DataSet == "era5-land") {
+        Type <- NA
+    }
+    if (DataSet == "era5") {
+        DataSet <- paste(DataSet, "single-levels", sep = "-")
+    }
+    DataSet <- paste("reanalysis", DataSet, sep = "-")
+    if (length(grep(DataSet, pattern = "preliminary")) != 1) {
+        if (TResolution != "hour" & TResolution != "day") {
+            DataSet <- paste0(DataSet, "-monthly", "-means")
+            if (Type != "reanalysis" & DataSet == "reanalysis-era5-single-levels-monthly-means") {
+                Type <- paste0("monthly_averaged_", Type)
+            }
+            else {
+                Type <- "monthly_averaged_reanalysis"
+            }
+        }
+    }
+    if (TypeOrigin == "monthly_averaged_reanalysis_by_hour_of_day") {
+        Type <- TypeOrigin
+    }
+    DateStart <- as.Date(DateStart)
+    if (PrecipFix == TRUE & TResolution == "day" | PrecipFix == 
+        TRUE & TResolution == "hour") {
+        DateStop <- as.Date(DateStop) + 1
+    }
+    else {
+        DateStop <- as.Date(DateStop)
+    }
+    Dates_seq <- seq(ymd(DateStart), ymd(DateStop), by = "1 day")
+    Months_vec <- format(Dates_seq, "%Y-%m")
+    Days_vec <- format(Dates_seq, "%d")
+    n_calls <- length(unique(Months_vec))
+    Calls_ls <- as.list(rep(NA, n_calls))
+    for (Calls_Iter in 1:n_calls) {
+        Calls_ls[[Calls_Iter]] <- c(gsub("-.*.", "", unique(Months_vec)[Calls_Iter]), 
+            gsub(".*.-", "", unique(Months_vec)[Calls_Iter]), 
+            min(Days_vec[which(Months_vec == unique(Months_vec)[Calls_Iter])]):max(Days_vec[which(Months_vec == 
+                unique(Months_vec)[Calls_Iter])]))
+    }
+    if (is.data.frame(Extent)) {
+        Extent <- buffer_Points(Points = Extent, Buffer = Buffer, 
+            ID = ID)
+    }
+    if (class(Extent) == "Raster" | class(Extent) == "SpatialPolygonsDataFrame" | 
+        class(Extent) == "SpatialPolygons") {
+        if (class(Extent) == "SpatialPolygonsDataFrame" | class(Extent) == 
+            "SpatialPolygons") {
+            Shape <- Extent
+        }
+        Extent <- extent(Extent)
+    }
+    if (class(Extent) != "Extent") {
+        stop("The Extent argument provided by you is neither formatted as an Extent nor a Raster nor SpatialPolygonsDataFrame object nor an object of only class data.frame. Please correct this.")
+    }
+    Modifier <- as.numeric(strsplit(Grid, "/")[[1]][1])
+    Extent <- try(paste(Extent[4] + Modifier, Extent[1] - Modifier, 
+        Extent[3] - Modifier, Extent[2] + Modifier, sep = "/"))
+    Corner_vec <- as.numeric(unlist(strsplit(Extent, "/")))
+    Musts_vec <- c(90, -180, -90, 180)
+    for (Iter_Corners in 1:length(Corner_vec)) {
+        if (abs(Corner_vec[Iter_Corners]) > abs(Musts_vec[Iter_Corners])) {
+            Corner_vec[Iter_Corners] <- Musts_vec[Iter_Corners]
+        }
+    }
+    Extent <- Corner_vec
+    if (TResolution == "hour" | TResolution == "day") {
+        Times <- str_pad(str_c(0:23, "00", sep = ":"), 5, "left", 
+            "0")
+    }
+    else {
+        Times <- "00:00"
+        if (TypeOrigin == "monthly_averaged_reanalysis_by_hour_of_day") {
+            Times <- str_pad(str_c(0:23, "00", sep = ":"), 5, 
+                "left", "0")
+        }
+    }
+    if (is.null(FileName)) {
+        FileName <- paste(Variable, DateStart, DateStop, TResolution, 
+            sep = "_")
+    }
+    FileName <- tools::file_path_sans_ext(FileName)
+    FileName <- paste0(FileName, ".nc")
+    FileNames_vec <- paste0(str_pad(1:n_calls, 4, "left", "0"), 
+        "_", FileName)
+    if (SingularDL) {
+        n_calls <- 1
+        FileNames_vec <- FileNames_vec[1]
+        Cores <- 1
+    }
+    looptext <- "\nif(SingularDL){ # If user forced download to happen in one\n                     ## finding the start and stop dates for SingularDownload\n                     SingularDL_Start <- as.Date(paste(\n                       min(unique(sapply(Calls_ls, '[[', 1))),\n                       min(unique(sapply(Calls_ls, '[[', 2))),\n                       str_pad(min(as.numeric(unique(unlist(lapply(Calls_ls, function(x) x[-1:-2]))))), 2, 'left', '0'),\n                       sep = '-'))\n                     SingularDL_Stop <- as.Date(paste(\n                       max(unique(sapply(Calls_ls, '[[', 1))),\n                       max(unique(sapply(Calls_ls, '[[', 2))),\n                       days_in_month(Dates_seq[length(Dates_seq)]),\n                       sep = '-'))\n                     if(TResolution == 'day' | TResolution == 'hour'){\n      LayerDL_seq <- paste(rep(seq.Date(from = SingularDL_Start, to = SingularDL_Stop, by = 'day'), each = 24), paste0(str_pad(1:24, 2, 'left', 0), ':00'), sep = '_')\n    }else{\n      LayerDL_seq <- seq.Date(from = SingularDL_Start, to = SingularDL_Stop, by = 'month')\n    }\n                     if(length(LayerDL_seq)>1e5){stop('Your download is too big. Please specify a shorter time window, coarser temporal resolution, or set SingularDL = FALSE.')}\n                     ## notify user of mismatch in time windows if there is one\n                     if(SingularDL_Start != DateStart | SingularDL_Stop != DateStop){\n                     if(TypeOrigin != 'reanalysis'){stop('Currently, SIngularDL may only be toggled on for reanalysis type download queries or any query where full months within one year, or full years of data are queried irrespective of dataset type.')}\n                       message(paste('Setting SingularDL to TRUE has forced your download to retrieve data in intervals of', TStep, TResolution, 'between', SingularDL_Start, '(YYYY-MM-DD) and', SingularDL_Stop, '(YYYY-MM-DD). KrigR will limit the data to your originally desired time range of', DateStart, '(YYYY-MM-DD) to', DateStop, '(YYYY-MM-DD).')\n                       )\n                     }\n                   }\n\n                   if(SingularDL){\n                     FName <- FileNames_vec[1]\n                     Year_call <- unique(sapply(Calls_ls, '[[', 1))\n                     month_call <- unique(sapply(Calls_ls, '[[', 2))\n                     day_call <- str_pad(unique(unlist(lapply(Calls_ls, function(x) x[-1:-2]))), 2, 'left', 0)\n                   }else{\n                     FName <- FileNames_vec[Downloads_Iter]\n                     Year_call <- Calls_ls[[Downloads_Iter]][1]\n                     month_call <- Calls_ls[[Downloads_Iter]][2]\n                     day_call <- Calls_ls[[Downloads_Iter]][3:length(Calls_ls[[Downloads_Iter]])]\n                   }\n\n                   ### Requesting Download\n                   Request_ls <- list('dataset_short_name' = DataSet,\n                                      'product_type'   = Type,\n                                      'variable'       = Variable,\n                                      'year'           = Year_call,\n                                      'month'          = month_call,\n                                      'day'            = day_call,\n                                      'time'           = Times,\n                                      'area'           = Extent,\n                                      'format'         = 'netcdf',\n                                      'target'         = FName,\n                                      'grid'           = Grid\n                   )\n\n                   if(file.exists(file.path(Dir, FName))){\n                     if(verbose){message(paste(FName, 'already downloaded'))}\n                   }else{\n                   if(verbose & SingularDL){message('Staging your request as a singular download now. This can take a long time due to size of required product.')}\n                     if(verbose){message(paste(FName, 'download queried'))}\n                     Down_try <- 0\n                     while(!file.exists(file.path(Dir, FName)) & Down_try < TryDown){\n                       if(Down_try>1){message('Retrying Download')}\n                       API_request <- 1\n                       try(API_request <- wf_request(user = as.character(API_User),\n                                                     request = Request_ls,\n                                                     transfer = TRUE,\n                                                     path = Dir,\n                                                     verbose = verbose,\n                                                     time_out = TimeOut))\n                       if(length(API_request) != 1){\n                         wf_delete(user = as.character(API_User),\n                                   url = API_request$request_id,\n                                   service = API_Service)\n                       }\n                       Down_try <- Down_try+1\n                     }\n                   }\n"
+    if (verbose) {
+        message(paste("Staging", n_calls, "download(s)."))
+    }
+    if (Cores > 1) {
+        ForeachObjects <- c("DataSet", "Type", "Variable", "Calls_ls", 
+            "Times", "Extent", "FileNames_vec", "Grid", "API_Key", 
+            "API_User", "Dir", "verbose", "TryDown", "TimeOut", 
+            "API_Service", "TResolution", "SingularDL")
+        pb <- txtProgressBar(max = n_calls, style = 3)
+        progress <- function(n) {
+            setTxtProgressBar(pb, n)
+        }
+        opts <- list(progress = progress)
+        cl <- makeCluster(Cores)
+        registerDoSNOW(cl)
+        foreach::foreach(Downloads_Iter = 1:n_calls, .packages = c("ecmwfr"), 
+            .export = ForeachObjects, .options.snow = opts) %:% 
+            when(!file.exists(file.path(Dir, FileNames_vec[Downloads_Iter]))) %dopar% 
+            {
+                eval(parse(text = looptext))
+            }
+        close(pb)
+        stopCluster(cl)
+    }
+    else {
+        for (Downloads_Iter in 1:n_calls) {
+            eval(parse(text = looptext))
+        }
+    }
+    FileName <- tools::file_path_sans_ext(FileName)
+    if (verbose) {
+        message("Checking for known data issues.")
+    }
+    Files_vec <- file.path(Dir, FileNames_vec)
+    if (is.na(Type)) {
+        Type <- "reanalysis"
+    }
+    if (Type == "ensemble_members" | Type == "monthly_averaged_ensemble_members") {
+        Layers <- 1:10
+    }
+    else {
+        Layers <- 1
+        for (Layers_Check in 1:length(Files_vec)) {
+            LayersSame <- suppressWarnings(all.equal(brick(Files_vec[Layers_Check], 
+                level = 1), brick(Files_vec[Layers_Check], level = 2)))
+            if (LayersSame == FALSE) {
+                Era5_ras <- brick(Files_vec[Layers_Check], level = 1)
+                Era5_ras2 <- brick(Files_vec[Layers_Check], level = 2)
+                Sums_vec <- NA
+                for (Iter_Check in 1:nlayers(Era5_ras2)) {
+                  Sums_vec <- c(Sums_vec, sum(values(Era5_ras2[[Iter_Check]]), 
+                    na.rm = TRUE))
+                }
+                Sums_vec <- na.omit(Sums_vec)
+                StopFirst <- min(which(Sums_vec != 0))
+                Era5_ras <- stack(Era5_ras[[1:(StopFirst - 1)]], 
+                  Era5_ras2[[StopFirst:nlayers(Era5_ras2)]])
+                writeRaster(Era5_ras, filename = Files_vec[Layers_Check])
+            }
+        }
+    }
+}
+
+
+# A modified download_ERA function to work on data that we have already
+# downloaded. This function does not remove the original data downloaded.
+download_ERA2 <- function (Variable = NULL, PrecipFix = FALSE, Type = "reanalysis", 
+    DataSet = "era5-land", DateStart = "1981-01-01", DateStop = Sys.Date() - 
+        100, TResolution = "month", TStep = 1, FUN = "mean", 
+    Extent = extent(-180, 180, -90, 90), Buffer = 0.5, ID = "ID", 
+    Dir = getwd(), FileName = NULL, API_User = NULL, API_Key = NULL, 
+    TryDown = 10, verbose = TRUE, Cores = 1, TimeOut = 36000, 
+    SingularDL = FALSE) 
+{
+    if (verbose) {
+        message("download_ERA() is starting. Depending on your specifications, this can take a significant time.")
+    }
+    if (verbose) {
+        ProgBar <- "text"
+    }
+    else {
+        ProgBar <- NULL
+    }
+    API_Service = "cds"
+    wf_set_key(user = as.character(API_User), key = as.character(API_Key), 
+        service = API_Service)
+    if (DataSet == "era5-land") {
+        Grid <- ".1/.1"
+    }
+    else {
+        Grid <- ".5/.5"
+    }
+    TypeOrigin <- Type
+    if (DataSet == "era5-land") {
+        Type <- NA
+    }
+    if (DataSet == "era5") {
+        DataSet <- paste(DataSet, "single-levels", sep = "-")
+    }
+    DataSet <- paste("reanalysis", DataSet, sep = "-")
+    if (length(grep(DataSet, pattern = "preliminary")) != 1) {
+        if (TResolution != "hour" & TResolution != "day") {
+            DataSet <- paste0(DataSet, "-monthly", "-means")
+            if (Type != "reanalysis" & DataSet == "reanalysis-era5-single-levels-monthly-means") {
+                Type <- paste0("monthly_averaged_", Type)
+            }
+            else {
+                Type <- "monthly_averaged_reanalysis"
+            }
+        }
+    }
+    if (TypeOrigin == "monthly_averaged_reanalysis_by_hour_of_day") {
+        Type <- TypeOrigin
+    }
+    DateStart <- as.Date(DateStart)
+    if (PrecipFix == TRUE & TResolution == "day" | PrecipFix == 
+        TRUE & TResolution == "hour") {
+        DateStop <- as.Date(DateStop) + 1
+    }
+    else {
+        DateStop <- as.Date(DateStop)
+    }
+    Dates_seq <- seq(ymd(DateStart), ymd(DateStop), by = "1 day")
+    Months_vec <- format(Dates_seq, "%Y-%m")
+    Days_vec <- format(Dates_seq, "%d")
+    n_calls <- length(unique(Months_vec))
+    Calls_ls <- as.list(rep(NA, n_calls))
+    for (Calls_Iter in 1:n_calls) {
+        Calls_ls[[Calls_Iter]] <- c(gsub("-.*.", "", unique(Months_vec)[Calls_Iter]), 
+            gsub(".*.-", "", unique(Months_vec)[Calls_Iter]), 
+            min(Days_vec[which(Months_vec == unique(Months_vec)[Calls_Iter])]):max(Days_vec[which(Months_vec == 
+                unique(Months_vec)[Calls_Iter])]))
+    }
+    if (is.data.frame(Extent)) {
+        Extent <- buffer_Points(Points = Extent, Buffer = Buffer, 
+            ID = ID)
+    }
+    if (class(Extent) == "Raster" | class(Extent) == "SpatialPolygonsDataFrame" | 
+        class(Extent) == "SpatialPolygons") {
+        if (class(Extent) == "SpatialPolygonsDataFrame" | class(Extent) == 
+            "SpatialPolygons") {
+            Shape <- Extent
+        }
+        Extent <- extent(Extent)
+    }
+    if (class(Extent) != "Extent") {
+        stop("The Extent argument provided by you is neither formatted as an Extent nor a Raster nor SpatialPolygonsDataFrame object nor an object of only class data.frame. Please correct this.")
+    }
+    Modifier <- as.numeric(strsplit(Grid, "/")[[1]][1])
+    Extent <- try(paste(Extent[4] + Modifier, Extent[1] - Modifier, 
+        Extent[3] - Modifier, Extent[2] + Modifier, sep = "/"))
+    Corner_vec <- as.numeric(unlist(strsplit(Extent, "/")))
+    Musts_vec <- c(90, -180, -90, 180)
+    for (Iter_Corners in 1:length(Corner_vec)) {
+        if (abs(Corner_vec[Iter_Corners]) > abs(Musts_vec[Iter_Corners])) {
+            Corner_vec[Iter_Corners] <- Musts_vec[Iter_Corners]
+        }
+    }
+    Extent <- Corner_vec
+    if (TResolution == "hour" | TResolution == "day") {
+        Times <- str_pad(str_c(0:23, "00", sep = ":"), 5, "left", 
+            "0")
+    }
+    else {
+        Times <- "00:00"
+        if (TypeOrigin == "monthly_averaged_reanalysis_by_hour_of_day") {
+            Times <- str_pad(str_c(0:23, "00", sep = ":"), 5, 
+                "left", "0")
+        }
+    }
+    if (is.null(FileName)) {
+        FileName <- paste(Variable, DateStart, DateStop, TResolution, 
+            sep = "_")
+    }
+    FileName <- tools::file_path_sans_ext(FileName)
+    FileName <- paste0(FileName, ".nc")
+    FileNames_vec <- paste0(str_pad(1:n_calls, 4, "left", "0"), 
+        "_", FileName)
+    if (SingularDL) {
+        n_calls <- 1
+        FileNames_vec <- FileNames_vec[1]
+        Cores <- 1
+    }
+# We don't need looptext.
+#    looptext <- "kk"
+    if (verbose) {
+        message(paste("Staging", n_calls, "download(s)."))
+    }
+# Disable data download (since we already have the data)
+#    if (Cores > 1) {
+#        ForeachObjects <- c("DataSet", "Type", "Variable", "Calls_ls", 
+#            "Times", "Extent", "FileNames_vec", "Grid", "API_Key", 
+#            "API_User", "Dir", "verbose", "TryDown", "TimeOut", 
+#            "API_Service", "TResolution", "SingularDL")
+#        pb <- txtProgressBar(max = n_calls, style = 3)
+#        progress <- function(n) {
+#            setTxtProgressBar(pb, n)
+#        }
+#        opts <- list(progress = progress)
+#        cl <- makeCluster(Cores)
+#        registerDoSNOW(cl)
+#        foreach::foreach(Downloads_Iter = 1:n_calls, .packages = c("ecmwfr"), 
+#            .export = ForeachObjects, .options.snow = opts) %:% 
+#            when(!file.exists(file.path(Dir, FileNames_vec[Downloads_Iter]))) %dopar% 
+#            {
+#                eval(parse(text = looptext))
+#            }
+#        close(pb)
+#        stopCluster(cl)
+#    } else {
+#        for (Downloads_Iter in 1:n_calls) {
+#            eval(parse(text = looptext))
+#    }
+#    }
+    FileName <- tools::file_path_sans_ext(FileName)
+    if (verbose) {
+        message("Checking for known data issues.")
+    }
+    Files_vec <- file.path(Dir, FileNames_vec)
+    if (is.na(Type)) {
+        Type <- "reanalysis"
+    }
+    if (Type == "ensemble_members" | Type == "monthly_averaged_ensemble_members") {
+        Layers <- 1:10
+    } else {
+        Layers <- 1
+        for (Layers_Check in 1:length(Files_vec)) {
+            LayersSame <- suppressWarnings(all.equal(brick(Files_vec[Layers_Check], 
+                level = 1), brick(Files_vec[Layers_Check], level = 2)))
+            if (LayersSame == FALSE) {
+                Era5_ras <- brick(Files_vec[Layers_Check], level = 1)
+                Era5_ras2 <- brick(Files_vec[Layers_Check], level = 2)
+                Sums_vec <- NA
+                for (Iter_Check in 1:nlayers(Era5_ras2)) {
+                  Sums_vec <- c(Sums_vec, sum(values(Era5_ras2[[Iter_Check]]), 
+                    na.rm = TRUE))
+                }
+                Sums_vec <- na.omit(Sums_vec)
+                StopFirst <- min(which(Sums_vec != 0))
+                Era5_ras <- stack(Era5_ras[[1:(StopFirst - 1)]], 
+                  Era5_ras2[[StopFirst:nlayers(Era5_ras2)]])
+                writeRaster(Era5_ras, filename = Files_vec[Layers_Check])
+            }
+        }
+    }
+    if (verbose) {
+        message("Loading downloaded data for masking and aggregation.")
+    }
+    if (length(Layers) == 1) {
+        Era5_ras <- stack(Files_vec)
+    } else {
+        Era5_ls <- as.list(rep(NA, length(Layers)))
+        for (LoadIter in Layers) {
+            ERA5_ls <- as.list(rep(NA, n_calls))
+            for (LOADIter in 1:n_calls) {
+                ERA5_ls[[LOADIter]] <- raster::brick(x = Files_vec[LOADIter], 
+                  level = Layers[[LoadIter]])
+            }
+            Era5_ras <- stack(ERA5_ls)
+            Era5_ls[[LoadIter]] <- Era5_ras
+        }
+        Era5_ras <- stack(Era5_ls)
+    }
+    MaxOffset <- max(abs(round(as.vector(extent(Era5_ras)) - 
+        c(Extent[2], Extent[4], Extent[3], Extent[1]), 2)))
+    if (MaxOffset > 270) {
+        DataOffset <- min(abs(round(as.vector(extent(Era5_ras)) - 
+            c(Extent[2], Extent[4], Extent[3], Extent[1]), 2)))
+        extent(Era5_ras) <- extent(Extent[2] - DataOffset, Extent[4] + 
+            DataOffset, Extent[3] - DataOffset, Extent[1] + DataOffset)
+    }
+    if (TResolution == "day" | TResolution == "hour") {
+        Layer_seq <- paste(rep(seq.Date(from = DateStart, to = DateStop, 
+            by = "day"), each = 24), paste0(str_pad(1:24, 2, 
+            "left", 0), ":00"), sep = "_")
+    }
+    else {
+        Layer_seq <- seq.Date(from = DateStart, to = DateStop, 
+            by = "month")
+    }
+    if (DateStart == "1950-01-01" & TResolution == "day" | TResolution == 
+        "hour") {
+        Layer_seq <- Layer_seq[-1]
+    }
+    if (SingularDL) {
+        if (TResolution == "day" | TResolution == "hour") {
+            LayerDL_seq <- paste(rep(seq.Date(from = SingularDL_Start, 
+                to = SingularDL_Stop, by = "day"), each = 24), 
+                paste0(str_pad(1:24, 2, "left", 0), ":00"), sep = "_")
+        }
+        else {
+            LayerDL_seq <- seq.Date(from = SingularDL_Start, 
+                to = SingularDL_Stop, by = "month")
+        }
+        if (DateStart == "1950-01-01" & TResolution == "day" | 
+            TResolution == "hour") {
+            LayerDL_seq <- LayerDL_seq[-1]
+        }
+        if (Type == "ensemble_members") {
+            LayerDL_seq <- rep(LayerDL_seq[rep(c(TRUE, c(FALSE, 
+                FALSE)), length.out = length(LayerDL_seq))], 
+                each = 10)
+            Layer_seq <- rep(Layer_seq[rep(c(TRUE, c(FALSE, FALSE)), 
+                length.out = length(Layer_seq))], each = 10)
+        }
+        if (Type == "monthly_averaged_ensemble_members") {
+            LayerDL_seq <- rep(LayerDL_seq, each = 10)
+            Layer_seq <- rep(LayerDL_seq, each = 10)
+        }
+        Era5_ras <- Era5_ras[[which(LayerDL_seq %in% Layer_seq)]]
+    }
+    if (Type == "ensemble_members" & TResolution == "hour") {
+        Indices <- sub(pattern = "X", replacement = "", names(Era5_ras))
+        Indices <- sub(pattern = ".*\\_", replacement = "", Indices)
+        Indices2 <- strsplit(x = Indices, split = ".", fixed = TRUE)
+        Len <- length(Indices2[[1]])
+        Indices3 <- str_pad(unlist(Indices2), 3, "left", "0")
+        PairNumbers <- rep(1:(length(Indices3)/Len), each = Len)
+        Indices4 <- paste(Indices3[which(PairNumbers == 1)], 
+            collapse = "")
+        for (IndicesIter in 2:(length(Indices3)/Len)) {
+            Indices4 <- c(Indices4, paste(Indices3[which(PairNumbers == 
+                IndicesIter)], collapse = ""))
+        }
+        Indices4 <- as.numeric(Indices4)
+        Era5_ras <- Era5_ras[[order(Indices4)]]
+    }
+    if (exists("Shape")) {
+        if (verbose) {
+            message("Masking according to shape/buffer polygon")
+        }
+        range_m <- mask_Shape(base.map = Era5_ras[[1]], Shape = Shape)
+        Era5_ras <- mask(Era5_ras, range_m, progress = ProgBar)
+    }
+    if (verbose) {
+        message("Aggregating to temporal resolution of choice")
+    }
+    if (PrecipFix == TRUE & TResolution == "day" | PrecipFix == 
+        TRUE & TResolution == "hour") {
+        if (DateStart == "1950-01-01") {
+            Era5_ras <- Era5_ras[[-(nlayers(Era5_ras) - 22):-nlayers(Era5_ras)]]
+        }
+        else {
+            Era5_ras <- Era5_ras[[c(-1, -(nlayers(Era5_ras) - 
+                22):-nlayers(Era5_ras))]]
+        }
+        counter <- 1
+        Era5_ls <- as.list(rep(NA, nlayers(Era5_ras)))
+        names(Era5_ls) <- names(Era5_ras)
+        for (i in 1:nlayers(Era5_ras)) {
+            if (counter > 24) {
+                counter <- 1
+            }
+            if (counter == 1) {
+                Era5_ls[[i]] <- Era5_ras[[i]]
+                StartI <- i
+            }
+            if (counter == 24) {
+                Era5_ls[[i]] <- Era5_ras[[i]] - sum(brick(Era5_ls[StartI:(StartI + 
+                  counter - 2)]))
+            }
+            if (counter != 24 & counter != 1) {
+                Era5_ls[[i]] <- Era5_ras[[i + 1]] - Era5_ras[[i]]
+            }
+            counter <- counter + 1
+        }
+        Era5_ras <- stack(Era5_ls)
+        warning("You toggled on the PrecipFix option in the function call. Hourly records have been converted from cumulative aggregates to individual hourly records of precipitation. This is currently an experimental feature.")
+    }
+    if (PrecipFix == TRUE & TResolution == "month" | PrecipFix == 
+        TRUE & TResolution == "year") {
+        if (Type != "ensemble_members" & Type != "monthly_averaged_ensemble_members") {
+            Days_in_Month_vec <- days_in_month(seq(ymd(DateStart), 
+                ymd(DateStop), by = "1 month"))
+        }
+        else {
+            Days_in_Month_vec <- rep(days_in_month(seq(ymd(DateStart), 
+                ymd(DateStop), by = "1 month")), each = 10)
+        }
+        Era5_ras <- Era5_ras * Days_in_Month_vec
+        warning("You toggled on the PrecipFix option in the function call. Monthly records have been multiplied by the amount of days per respective month. This is currently an experimental feature.")
+    }
+    if (TResolution == "day" | TResolution == "year") {
+        if (TResolution == "day") {
+            if (Type == "reanalysis") {
+                factor <- 24
+            }
+            else {
+                factor <- 8
+            }
+        }
+        else {
+            factor <- 12
+        }
+        if (Type != "ensemble_members" & Type != "monthly_averaged_ensemble_members") {
+            if (TResolution == "hour" | TResolution == "day" & 
+                DateStart == "1950-01-01") {
+                Index <- rep(1:((nlayers(Era5_ras) + 1)/factor), 
+                  each = factor)[-1]
+            }
+            else {
+                Index <- rep(1:(nlayers(Era5_ras)/factor), each = factor)
+            }
+        }
+        else {
+            Index <- rep(1:(nlayers(Era5_ras)/factor), each = factor * 
+                10)
+        }
+        if (sum(duplicated(Index)) != 0) {
+            Era5_ras <- stackApply(Era5_ras, Index, fun = FUN, 
+                progress = ProgBar)
+            if (exists("range_m")) {
+                Era5_ras <- mask(Era5_ras, range_m)
+            }
+        }
+    }
+    if (nlayers(Era5_ras)%%TStep != 0) {
+        warning(paste0("Your specified time range does not allow for a clean integration of your selected time steps. Only full time steps will be computed. You specified a time series with a length of ", 
+            nlayers(Era5_ras), "(", TResolution, ") and time steps of ", 
+            TStep, ". This works out to ", nlayers(Era5_ras)/TStep, 
+            " intervals. You will receive ", floor(nlayers(Era5_ras)/TStep), 
+            " intervals."))
+    }
+    Index <- rep(1:(nlayers(Era5_ras)/TStep), each = TStep)
+    if (sum(duplicated(Index)) != 0) {
+        Era5_ras <- stackApply(Era5_ras[[1:length(Index)]], Index, 
+            fun = FUN, progress = ProgBar)
+        if (exists("range_m")) {
+            Era5_ras <- mask(Era5_ras, range_m)
+        }
+    }
+    writeRaster(x = Era5_ras, filename = file.path(Dir, FileName), 
+        overwrite = TRUE, format = "CDF", varname = Variable)
+# do not remove original data files
+#    unlink(Files_vec, recursive = TRUE)
+    return(stack(file.path(Dir, paste0(FileName, ".nc"))))
+}
+
+pcp <- download_ERA2(
+  Variable = 'Total_precipitation',
+  DataSet = 'era5-land',
+  DateStart = '1981-01-01',
+  DateStop = '2020-12-31',
+  TResolution = 'hour',
+  TStep = 24,
+  FUN = 'sum',
+  Extent = shp_geo,
+  Dir = '../data_raw/era5',
+  API_User = API_usr,
+  API_Key = API_key
+)
+```
+
+

@@ -46,9 +46,9 @@ shp_geo <- readOGR('../data_raw/gis/españa_peninsular_EPSG4326.shp')
 #shp_utm <- spTransform(shp_geo, prj_utm)
 #shp_utm_tdy <- broom::tidy(shp_utm)
 
-# Copernicus API user and key
-API_usr <- '178221'
-API_key <- '87924e78-559e-4f8a-bd48-34aa8508c446'
+# Copernicus API user and key - add yours here!
+API_usr <- ''
+API_key <- ''
 ```
 
 
